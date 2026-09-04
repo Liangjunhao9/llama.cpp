@@ -19,71 +19,42 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
     float sumf = 0.0f;
 
     #if defined(__ARM_FEATURE_SVE)
-        const int sve_register_length = ggml_cpu_get_sve_cnt() * 8;
-        const int ggml_f32_epr = sve_register_length / 32;//8;//svcntw(); // SVE128:4, SVE256:8, SVE512:16
-        const int ggml_f32_step = 8 * ggml_f32_epr; // choose 8 SVE registers
+        const int sve_f32_lanes = (int) svcntw();
+        const int step = 4 * sve_f32_lanes;
+        const int np = n - n % step;
+        const svbool_t pg_all = svptrue_b32();
 
-        const int np = (n & ~(ggml_f32_step - 1));
-        svfloat32_t sum1 = svdup_n_f32(0.0f);
-        svfloat32_t sum2 = svdup_n_f32(0.0f);
-        svfloat32_t sum3 = svdup_n_f32(0.0f);
-        svfloat32_t sum4 = svdup_n_f32(0.0f);
-        svfloat32_t sum5 = svdup_n_f32(0.0f);
-        svfloat32_t sum6 = svdup_n_f32(0.0f);
-        svfloat32_t sum7 = svdup_n_f32(0.0f);
-        svfloat32_t sum8 = svdup_n_f32(0.0f);
-        svfloat32_t ax1,ax2,ax3,ax4,ax5,ax6,ax7,ax8;
-        svfloat32_t ay1,ay2,ay3,ay4,ay5,ay6,ay7,ay8;
-        for (int i = 0; i < np; i += ggml_f32_step) {
-            ax1 = GGML_F32_VEC_LOAD(x + i);
-            ay1 = GGML_F32_VEC_LOAD(y + i);
-            sum1 = GGML_F32_VEC_FMA(sum1, ax1, ay1);
+        assert(sve_f32_lanes > 0);
 
-            ax2 = GGML_F32_VEC_LOAD(x + i + 1*ggml_f32_epr);
-            ay2 = GGML_F32_VEC_LOAD(y + i + 1*ggml_f32_epr);
-            sum2 = GGML_F32_VEC_FMA(sum2, ax2, ay2);
+        svfloat32_t sum0 = svdup_f32(0.0f);
+        svfloat32_t sum1 = svdup_f32(0.0f);
+        svfloat32_t sum2 = svdup_f32(0.0f);
+        svfloat32_t sum3 = svdup_f32(0.0f);
 
-            ax3 = GGML_F32_VEC_LOAD(x + i + 2*ggml_f32_epr);
-            ay3 = GGML_F32_VEC_LOAD(y + i + 2*ggml_f32_epr);
-            sum3 = GGML_F32_VEC_FMA(sum3, ax3, ay3);
+        int i = 0;
+        for (; i < np; i += step) {
+            const float * const px = x + i;
+            const float * const py = y + i;
 
-            ax4 = GGML_F32_VEC_LOAD(x + i + 3*ggml_f32_epr);
-            ay4 = GGML_F32_VEC_LOAD(y + i + 3*ggml_f32_epr);
-            sum4 = GGML_F32_VEC_FMA(sum4, ax4, ay4);
-
-            ax5 = GGML_F32_VEC_LOAD(x + i + 4*ggml_f32_epr);
-            ay5 = GGML_F32_VEC_LOAD(y + i + 4*ggml_f32_epr);
-            sum5 = GGML_F32_VEC_FMA(sum5, ax5, ay5);
-
-            ax6 = GGML_F32_VEC_LOAD(x + i + 5*ggml_f32_epr);
-            ay6 = GGML_F32_VEC_LOAD(y + i + 5*ggml_f32_epr);
-            sum6 = GGML_F32_VEC_FMA(sum6, ax6, ay6);
-
-            ax7 = GGML_F32_VEC_LOAD(x + i + 6*ggml_f32_epr);
-            ay7 = GGML_F32_VEC_LOAD(y + i + 6*ggml_f32_epr);
-            sum7 = GGML_F32_VEC_FMA(sum7, ax7, ay7);
-
-            ax8 = GGML_F32_VEC_LOAD(x + i + 7*ggml_f32_epr);
-            ay8 = GGML_F32_VEC_LOAD(y + i + 7*ggml_f32_epr);
-            sum8 = GGML_F32_VEC_FMA(sum8, ax8, ay8);
+            sum0 = svmla_f32_x(pg_all, sum0,
+                               svld1_vnum_f32(pg_all, px, 0), svld1_vnum_f32(pg_all, py, 0));
+            sum1 = svmla_f32_x(pg_all, sum1,
+                               svld1_vnum_f32(pg_all, px, 1), svld1_vnum_f32(pg_all, py, 1));
+            sum2 = svmla_f32_x(pg_all, sum2,
+                               svld1_vnum_f32(pg_all, px, 2), svld1_vnum_f32(pg_all, py, 2));
+            sum3 = svmla_f32_x(pg_all, sum3,
+                               svld1_vnum_f32(pg_all, px, 3), svld1_vnum_f32(pg_all, py, 3));
         }
-        // leftovers
-        // Since 8 unrolls are done in above loop, leftovers lie in range [0, ggml_f32_step] which is handled in below loop
-        const int np2 = (n & ~(ggml_f32_epr - 1));
-        for (int i = np; i < np2; i += ggml_f32_epr) {
-            ax1 = GGML_F32_VEC_LOAD(x + i);
-            ay1 = GGML_F32_VEC_LOAD(y + i);
-            sum1 = GGML_F32_VEC_FMA(sum1, ax1, ay1);
+
+        while (i < n) {
+            const svbool_t pg = svwhilelt_b32((int32_t) i, (int32_t) n);
+            sum0 = svmla_f32_m(pg, sum0, svld1_f32(pg, x + i), svld1_f32(pg, y + i));
+            i += sve_f32_lanes;
         }
-        // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmla on available elements only
-        if (np2 < n) {
-            svbool_t pg = svwhilelt_b32(np2, n);
-            ax1 = svld1_f32(pg, x + np2);
-            ay1 = svld1_f32(pg, y + np2);
-            sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
-        }
-        // reduce sum1,sum2 to sum1
-        GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
+
+        sum0 = svadd_f32_x(pg_all, sum0, sum1);
+        sum2 = svadd_f32_x(pg_all, sum2, sum3);
+        sumf = svaddv_f32(pg_all, svadd_f32_x(pg_all, sum0, sum2));
     #elif defined(__riscv_v_intrinsic)
         int vl = __riscv_vsetvlmax_e32m8();
         vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, 1);

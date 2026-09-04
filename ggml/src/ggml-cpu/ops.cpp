@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 // ggml_compute_forward_dup
 
@@ -3925,18 +3928,19 @@ static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
         ggml_tensor * dst_fused = nullptr) {
-
     const ggml_tensor * src0 = dst_rms_norm->src[0];
     const ggml_tensor * src1 = nullptr;
     ggml_tensor       * dst  = dst_rms_norm;
 
     if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
-        src1 = (dst_fused->src[0] == dst_rms_norm) ? dst_fused->src[1] : dst_fused->src[0];
-        dst  = dst_fused;
+        src1 = (dst_fused->src[0] == dst_rms_norm)
+                ? dst_fused->src[1]
+                : dst_fused->src[0];
+
+        dst = dst_fused;
     }
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
-
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
     const int ith = params->ith;
@@ -3948,31 +3952,332 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                const float * x = (const float *) (
+                        (const char *) src0->data +
+                        i01*nb01 +
+                        i02*nb02 +
+                        i03*nb03);
 
                 ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
+
+#if defined(__ARM_FEATURE_SVE)
+                {
+                    /*
+                     * 保持原始 C 实现的精度语义：
+                     *
+                     *     x[i] * x[i]              使用 FP32 计算
+                     *     (ggml_float) product     转换为 FP64
+                     *     sum += product           使用 FP64 累加
+                     *
+                     * 一个 SVE 寄存器能容纳的 FP32 元素数量，是 FP64
+                     * 元素数量的两倍。因此需要把 FP32 乘积分成上下两半，
+                     * 分别扩展成两个 FP64 向量。
+                     */
+                    const int64_t sve_vl_f32 = (int64_t) svcntw();
+                    const int64_t sve_vl_f64 = (int64_t) svcntd();
+
+                    const svbool_t pg_all_f64 = svptrue_b64();
+
+                    svfloat64_t sum_lo0 = svdup_n_f64(0.0);
+                    svfloat64_t sum_hi0 = svdup_n_f64(0.0);
+                    svfloat64_t sum_lo1 = svdup_n_f64(0.0);
+                    svfloat64_t sum_hi1 = svdup_n_f64(0.0);
+
+                    int64_t i00 = 0;
+
+                    /*
+                     * 两路展开。每轮处理两个完整的 FP32 SVE 向量，
+                     * 使用四个 FP64 累加器降低累加依赖。
+                     */
+                    for (; i00 + 2*sve_vl_f32 <= ne00;
+                           i00 += 2*sve_vl_f32) {
+                        const svbool_t pg_all_f32 = svptrue_b32();
+
+                        const svfloat32_t x0 = svld1_f32(
+                                pg_all_f32,
+                                x + i00);
+
+                        const svfloat32_t x1 = svld1_f32(
+                                pg_all_f32,
+                                x + i00 + sve_vl_f32);
+
+                        /*
+                         * 乘法必须保持为 FP32，不能先转换成 FP64 再平方，
+                         * 否则会改变原始实现的运算语义。
+                         */
+                        const svfloat32_t product0 =
+                                svmul_f32_x(pg_all_f32, x0, x0);
+
+                        const svfloat32_t product1 =
+                                svmul_f32_x(pg_all_f32, x1, x1);
+
+                        /*
+                         * svcvt_f64_f32_* 从偶数位置取得 FP32 元素。
+                         *
+                         * 使用 zip1(v, v)：
+                         *     [v0, v0, v1, v1, ...]
+                         *
+                         * 转换后得到原向量的下半部分：
+                         *     [double(v0), double(v1), ...]
+                         *
+                         * 使用 zip2(v, v) 对原向量上半部分做同样处理。
+                         */
+                        const svfloat32_t product0_lo_packed =
+                                svzip1_f32(product0, product0);
+
+                        const svfloat32_t product0_hi_packed =
+                                svzip2_f32(product0, product0);
+
+                        const svfloat32_t product1_lo_packed =
+                                svzip1_f32(product1, product1);
+
+                        const svfloat32_t product1_hi_packed =
+                                svzip2_f32(product1, product1);
+
+                        const svfloat64_t product0_lo =
+                                svcvt_f64_f32_x(
+                                        pg_all_f64,
+                                        product0_lo_packed);
+
+                        const svfloat64_t product0_hi =
+                                svcvt_f64_f32_x(
+                                        pg_all_f64,
+                                        product0_hi_packed);
+
+                        const svfloat64_t product1_lo =
+                                svcvt_f64_f32_x(
+                                        pg_all_f64,
+                                        product1_lo_packed);
+
+                        const svfloat64_t product1_hi =
+                                svcvt_f64_f32_x(
+                                        pg_all_f64,
+                                        product1_hi_packed);
+
+                        sum_lo0 = svadd_f64_x(
+                                pg_all_f64,
+                                sum_lo0,
+                                product0_lo);
+
+                        sum_hi0 = svadd_f64_x(
+                                pg_all_f64,
+                                sum_hi0,
+                                product0_hi);
+
+                        sum_lo1 = svadd_f64_x(
+                                pg_all_f64,
+                                sum_lo1,
+                                product1_lo);
+
+                        sum_hi1 = svadd_f64_x(
+                                pg_all_f64,
+                                sum_hi1,
+                                product1_hi);
+                    }
+
+                    /*
+                     * 处理剩余的 0～2*VL-1 个元素。
+                     */
+                    while (i00 < ne00) {
+                        const int64_t remaining = ne00 - i00;
+
+                        const int64_t count_f32 =
+                                remaining < sve_vl_f32
+                                        ? remaining
+                                        : sve_vl_f32;
+
+                        const int64_t count_lo =
+                                count_f32 < sve_vl_f64
+                                        ? count_f32
+                                        : sve_vl_f64;
+
+                        const int64_t count_hi =
+                                count_f32 > sve_vl_f64
+                                        ? count_f32 - sve_vl_f64
+                                        : 0;
+
+                        const svbool_t pg_f32 = svwhilelt_b32(
+                                (uint64_t) 0,
+                                (uint64_t) count_f32);
+
+                        const svbool_t pg_lo = svwhilelt_b64(
+                                (uint64_t) 0,
+                                (uint64_t) count_lo);
+
+                        const svbool_t pg_hi = svwhilelt_b64(
+                                (uint64_t) 0,
+                                (uint64_t) count_hi);
+
+                        const svfloat32_t vx =
+                                svld1_f32(pg_f32, x + i00);
+
+                        /*
+                         * inactive lanes 清零，避免 zip 后将无效数据带入
+                         * FP64 转换和累加。
+                         */
+                        const svfloat32_t product =
+                                svmul_f32_z(pg_f32, vx, vx);
+
+                        const svfloat32_t product_lo_packed =
+                                svzip1_f32(product, product);
+
+                        const svfloat32_t product_hi_packed =
+                                svzip2_f32(product, product);
+
+                        const svfloat64_t product_lo =
+                                svcvt_f64_f32_z(
+                                        pg_lo,
+                                        product_lo_packed);
+
+                        const svfloat64_t product_hi =
+                                svcvt_f64_f32_z(
+                                        pg_hi,
+                                        product_hi_packed);
+
+                        /*
+                         * 使用 merging 形式，使 inactive lanes 保持累加器
+                         * 原值。
+                         */
+                        sum_lo0 = svadd_f64_m(
+                                pg_lo,
+                                sum_lo0,
+                                product_lo);
+
+                        sum_hi0 = svadd_f64_m(
+                                pg_hi,
+                                sum_hi0,
+                                product_hi);
+
+                        i00 += count_f32;
+                    }
+
+                    /*
+                     * 先合并多个 FP64 累加器，再做水平归约。
+                     */
+                    sum_lo0 = svadd_f64_x(
+                            pg_all_f64,
+                            sum_lo0,
+                            sum_lo1);
+
+                    sum_hi0 = svadd_f64_x(
+                            pg_all_f64,
+                            sum_hi0,
+                            sum_hi1);
+
+                    sum_lo0 = svadd_f64_x(
+                            pg_all_f64,
+                            sum_lo0,
+                            sum_hi0);
+
+                    sum = (ggml_float) svaddv_f64(
+                            pg_all_f64,
+                            sum_lo0);
                 }
+#else
+                /*
+                 * 没有启用 SVE，完全使用原始实现。
+                 */
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum += (ggml_float) (x[i00] * x[i00]);
+                }
+#endif
 
                 const float mean  = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
 
-                // if you hit this, likely you got an inf somewhere earlier
+                // If you hit this, likely you got an inf somewhere earlier.
                 assert(scale > 0.0f);
 
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+                float * y = (float *) (
+                        (char *) dst->data +
+                        i01*nb1 +
+                        i02*nb2 +
+                        i03*nb3);
 
-                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+#if defined(__ARM_FEATURE_SVE)
+                {
+                    const int64_t sve_vl_f32 = (int64_t) svcntw();
+                    const svfloat32_t vscale = svdup_n_f32(scale);
+
+                    int64_t i00 = 0;
+
+                    if constexpr (
+                            FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+                        const int64_t i11 = i01 % ne11;
+                        const int64_t i12 = i02 % ne12;
+                        const int64_t i13 = i03 % ne13;
+
+                        const float * w = (const float *) (
+                                (const char *) src1->data +
+                                i11*nb11 +
+                                i12*nb12 +
+                                i13*nb13);
+
+                        /*
+                         * y = x * scale * w
+                         */
+                        while (i00 < ne00) {
+                            const svbool_t pg = svwhilelt_b32(
+                                    (uint64_t) i00,
+                                    (uint64_t) ne00);
+
+                            const svfloat32_t vx =
+                                    svld1_f32(pg, x + i00);
+
+                            const svfloat32_t vw =
+                                    svld1_f32(pg, w + i00);
+
+                            svfloat32_t vy =
+                                    svmul_f32_x(pg, vx, vscale);
+
+                            vy = svmul_f32_x(pg, vy, vw);
+
+                            svst1_f32(pg, y + i00, vy);
+
+                            i00 += sve_vl_f32;
+                        }
+                    } else {
+                        /*
+                         * 直接执行 y = x * scale。
+                         *
+                         * 相比先 memcpy 再调用 ggml_vec_scale_f32，
+                         * 这里只需要一次读取和一次写入。
+                         */
+                        while (i00 < ne00) {
+                            const svbool_t pg = svwhilelt_b32(
+                                    (uint64_t) i00,
+                                    (uint64_t) ne00);
+
+                            const svfloat32_t vx =
+                                    svld1_f32(pg, x + i00);
+
+                            const svfloat32_t vy =
+                                    svmul_f32_x(pg, vx, vscale);
+
+                            svst1_f32(pg, y + i00, vy);
+
+                            i00 += sve_vl_f32;
+                        }
+                    }
+                }
+#else
+                /*
+                 * 没有启用 SVE，完全使用原始输出实现。
+                 */
+                if constexpr (
+                        FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
                     const int64_t i11 = i01 % ne11;
                     const int64_t i12 = i02 % ne12;
                     const int64_t i13 = i03 % ne13;
-                    const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+                    const float * w = (const float *) (
+                            (const char *) src1->data +
+                            i11*nb11 +
+                            i12*nb12 +
+                            i13*nb13);
 
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
                         y[i00] = x[i00] * scale * w[i00];
@@ -3981,6 +4286,7 @@ static void ggml_compute_forward_rms_norm_f32(
                     memcpy(y, x, ne00 * sizeof(float));
                     ggml_vec_scale_f32(ne00, y, scale);
                 }
+#endif
             }
         }
     }
