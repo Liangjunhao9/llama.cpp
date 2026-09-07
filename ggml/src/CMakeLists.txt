@@ -585,6 +585,7 @@ elseif (GGML_CPU)
 endif()
 
 ggml_add_backend(BLAS)
+ggml_add_backend(KDNN)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
 ggml_add_backend(ET)
