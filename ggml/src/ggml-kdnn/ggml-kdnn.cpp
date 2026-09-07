@@ -14,6 +14,18 @@
 #include <memory>
 #include <tuple>
 
+static void ggml_kdnn_fp16_to_fp32(const ggml_fp16_t * src, float * dst, int64_t n) {
+#if defined(__aarch64__)
+    using fp16_alias = __fp16 __attribute__((may_alias));
+    const auto * values = reinterpret_cast<const fp16_alias *>(src);
+    for (int64_t i = 0; i < n; ++i) {
+        dst[i] = values[i];
+    }
+#else
+    ggml_fp16_to_fp32_row(src, dst, n);
+#endif
+}
+
 struct ggml_backend_kdnn_context {
     int n_threads = GGML_DEFAULT_N_THREADS;
     std::unique_ptr<float[]> src0_f32;
@@ -52,7 +64,6 @@ static void ggml_backend_kdnn_mul_mat(ggml_backend_kdnn_context * ctx, ggml_tens
     if (!gemm) {
         gemm = std::make_unique<KDNN::Gemm>(a_info, b_info, c_info);
     }
-
     for (int64_t i13 = 0; i13 < ne13; ++i13) {
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
             const int64_t i03 = i13 / r3;
@@ -62,7 +73,7 @@ static void ggml_backend_kdnn_mul_mat(ggml_backend_kdnn_context * ctx, ggml_tens
             const void * b = (const char *) src0->data + i02 * nb02 + i03 * nb03;
             void * c = (char *) dst->data + i12 * nb2 + i13 * nb3;
             if (src0->type == GGML_TYPE_F16) {
-                ggml_fp16_to_fp32_row((const ggml_fp16_t *) b, ctx->src0_f32.get(), src0_plane_elements);
+                ggml_kdnn_fp16_to_fp32((const ggml_fp16_t *) b, ctx->src0_f32.get(), src0_plane_elements);
                 b = ctx->src0_f32.get();
             }
             gemm->Run(a, b, c);
